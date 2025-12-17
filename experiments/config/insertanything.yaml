@@ -1,0 +1,37 @@
+flux_fill_path: "/inspire/hdd/project/multimodal-discrete-diffusion/liuxiaohong-25080/guangzhaoli/face/model/flux_fill"
+flux_redux_path: "/inspire/hdd/project/multimodal-discrete-diffusion/liuxiaohong-25080/guangzhaoli/face/model/flux_redux"
+dtype: "bfloat16"
+
+model:
+  union_cond_attn: true
+  add_cond_attn: false
+  latent_lora: false
+  use_face_loss: true
+  face_loss_weight: 1
+  arcface_model: "r100"                     # r50 或 r100
+  arcface_weights: "/inspire/hdd/project/multimodal-discrete-diffusion/liuxiaohong-25080/guangzhaoli/face/model/arcface/backbone.pth"  # 需下载 PyTorch 权重
+
+train:
+  batch_size: 16
+  accumulate_grad_batches: 1
+  dataloader_workers: 8
+  # pin_memory: false
+  save_interval: 500
+  sample_interval: 500
+  max_steps: -1
+  gradient_checkpointing: true
+  save_path: "runs"
+
+  lora_config:
+    r: 256
+    lora_alpha: 256
+    init_lora_weights: "gaussian"
+    target_modules: "(.*x_embedder|.*(?<!single_)transformer_blocks\\.[0-9]+\\.norm1\\.linear|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_k|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_q|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_v|.*(?<!single_)transformer_blocks\\.[0-9]+\\.attn\\.to_out\\.0|.*(?<!single_)transformer_blocks\\.[0-9]+\\.ff\\.net\\.2|.*single_transformer_blocks\\.[0-9]+\\.norm\\.linear|.*single_transformer_blocks\\.[0-9]+\\.proj_mlp|.*single_transformer_blocks\\.[0-9]+\\.proj_out|.*single_transformer_blocks\\.[0-9]+\\.attn.to_k|.*single_transformer_blocks\\.[0-9]+\\.attn.to_q|.*single_transformer_blocks\\.[0-9]+\\.attn.to_v|.*single_transformer_blocks\\.[0-9]+\\.attn.to_out)"
+
+  optimizer:
+    type: "Prodigy"
+    params:
+      lr: 1
+      use_bias_correction: true
+      safeguard_warmup: true
+      weight_decay: 0.01
