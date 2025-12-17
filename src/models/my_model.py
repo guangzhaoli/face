@@ -61,11 +61,27 @@ class InsertAnything(L.LightningModule):
 
         # Initialize face loss for face identity preservation
         self.use_face_loss = model_config.get("use_face_loss", False)
+        self.use_multiscale_face_loss = model_config.get(
+            "use_multiscale_face_loss", True
+        )
         if self.use_face_loss:
             self.face_loss_weight = model_config.get("face_loss_weight", 0.1)
             arcface_weights = model_config.get("arcface_weights", None)
             arcface_model = model_config.get("arcface_model", "r50")  # r50 or r100
             arcface_root = model_config.get("arcface_root", None)
+
+            # Multi-scale layer weights (deeper = more identity-related)
+            # Total effective weight ~2.0 (0.1+0.2+0.3+0.4+1.0)
+            self.multiscale_layer_weights = model_config.get(
+                "multiscale_layer_weights",
+                {
+                    "layer1": 0.1,  # Coarse face structure
+                    "layer2": 0.2,  # Mid-level features
+                    "layer3": 0.3,  # Fine facial details (eyes, nose, mouth)
+                    "layer4": 0.4,  # High-level semantic features
+                    "embedding": 1.0,  # Final identity embedding (most important)
+                },
+            )
 
             self.face_loss = DifferentiableFaceLoss(
                 model_name=arcface_model,
@@ -73,8 +89,11 @@ class InsertAnything(L.LightningModule):
                 device=device,
                 root=arcface_root,
             )
+            loss_type = (
+                "Multi-Scale" if self.use_multiscale_face_loss else "Single-Scale"
+            )
             print(
-                f"[InsertAnything] Differentiable Face Loss enabled with weight {self.face_loss_weight}"
+                f"[InsertAnything] {loss_type} Face Loss enabled with weight {self.face_loss_weight}"
             )
 
         if self.use_face_loss:
@@ -234,7 +253,6 @@ class InsertAnything(L.LightningModule):
         pooled_prompt_embeds = []
 
         for i in range(ref.shape[0]):
-
             image_tensor = ref[i].cpu()
 
             image_tensor = image_tensor.permute(1, 2, 0)
@@ -262,7 +280,6 @@ class InsertAnything(L.LightningModule):
 
         # Prepare inputs
         with torch.no_grad():
-
             # Prepare image input
             x_0, img_ids = encode_images(self.flux_fill_pipe, imgs)
 
@@ -359,7 +376,16 @@ class InsertAnything(L.LightningModule):
                     # ref is the reference face image (ground truth)
                     # pred_target is the model's prediction (gradients flow through here)
                     # NOTE: Convert to float32 - numpy in detect_faces doesn't support bfloat16
-                    face_loss = self.face_loss(ref.float(), pred_target.float())
+                    if self.use_multiscale_face_loss:
+                        # Multi-scale loss: combines features from all layers
+                        face_loss = self.face_loss.forward_multiscale(
+                            ref.float(),
+                            pred_target.float(),
+                            layer_weights=self.multiscale_layer_weights,
+                        )
+                    else:
+                        # Single-scale loss: only uses final identity embedding
+                        face_loss = self.face_loss(ref.float(), pred_target.float())
 
                     total_loss = mse_loss + self.face_loss_weight * face_loss
 

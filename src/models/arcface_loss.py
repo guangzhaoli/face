@@ -204,6 +204,44 @@ class IResNet(nn.Module):
         x = self.features(x)
         return x
 
+    def forward_multiscale(self, x: torch.Tensor) -> dict:
+        """
+        Extract multi-scale features from each layer.
+
+        Returns a dict with:
+        - 'layer1': (B, 64, 56, 56) - coarse features (face structure)
+        - 'layer2': (B, 128, 28, 28) - mid-level features
+        - 'layer3': (B, 256, 14, 14) - fine features (facial details)
+        - 'layer4': (B, 512, 7, 7) - semantic features (identity)
+        - 'embedding': (B, 512) - final identity embedding
+        """
+        features = {}
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.prelu(x)
+
+        x = self.layer1(x)
+        features["layer1"] = x  # (B, 64, 56, 56)
+
+        x = self.layer2(x)
+        features["layer2"] = x  # (B, 128, 28, 28)
+
+        x = self.layer3(x)
+        features["layer3"] = x  # (B, 256, 14, 14)
+
+        x = self.layer4(x)
+        features["layer4"] = x  # (B, 512, 7, 7)
+
+        x = self.bn2(x)
+        x = torch.flatten(x, 1)
+        x = self.dropout(x)
+        x = self.fc(x)
+        x = self.features(x)
+        features["embedding"] = x  # (B, 512)
+
+        return features
+
 
 def iresnet50(**kwargs) -> IResNet:
     """IResNet-50 model."""
@@ -532,6 +570,143 @@ class DifferentiableFaceLoss(nn.Module):
             return avg_loss, per_sample_losses, valid_mask
 
         return avg_loss
+
+    def extract_multiscale_features(self, face: torch.Tensor) -> dict:
+        """
+        Extract multi-scale features from face (differentiable).
+
+        Args:
+            face: (C, 112, 112) preprocessed face tensor
+
+        Returns:
+            Dict with features from each layer and final embedding
+        """
+        face = face.unsqueeze(0).to(
+            device=self.device, dtype=self._model_dtype
+        )  # (1, C, 112, 112)
+        features = self.recognizer.forward_multiscale(face)
+        # Squeeze batch dimension
+        return {k: v.squeeze(0) for k, v in features.items()}
+
+    def forward_multiscale(
+        self,
+        ref_images: torch.Tensor,
+        gen_images: torch.Tensor,
+        layer_weights: dict = None,
+        return_details: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute multi-scale differentiable face identity loss.
+
+        This loss combines:
+        1. Identity embedding loss (final 512-d vector)
+        2. Multi-scale feature losses from intermediate layers
+
+        Recommended layer_weights:
+        - layer1 (coarse structure): 0.1
+        - layer2 (mid-level): 0.2
+        - layer3 (fine details): 0.3
+        - layer4 (semantic): 0.4
+        - embedding (identity): 1.0
+
+        Args:
+            ref_images: Reference images, shape (B, C, H, W), values in [0, 1]
+            gen_images: Generated images, shape (B, C, H, W), values in [0, 1]
+            layer_weights: Dict of weights for each layer.
+                          Default: {'layer1': 0.1, 'layer2': 0.2, 'layer3': 0.3,
+                                    'layer4': 0.4, 'embedding': 1.0}
+            return_details: If True, also return per-layer losses
+
+        Returns:
+            total_loss: Weighted sum of all losses
+            If return_details: (total_loss, loss_dict) where loss_dict has per-layer losses
+        """
+        if layer_weights is None:
+            # Default weights: deeper layers get higher weights (more identity-related)
+            # Total effective weight ~2.0 (0.1+0.2+0.3+0.4+1.0)
+            layer_weights = {
+                "layer1": 0.1,  # Coarse face structure
+                "layer2": 0.2,  # Mid-level features
+                "layer3": 0.3,  # Fine facial details (eyes, nose, mouth)
+                "layer4": 0.4,  # High-level semantic features
+                "embedding": 1.0,  # Final identity embedding (most important)
+            }
+
+        batch_size = ref_images.shape[0]
+        device = gen_images.device
+
+        # Detect faces
+        ref_bboxes = self.detect_faces(ref_images)
+        gen_bboxes = self.detect_faces(gen_images)
+
+        # Accumulate losses per layer
+        layer_losses = {k: [] for k in layer_weights.keys()}
+        valid_indices = []
+
+        for i in range(batch_size):
+            ref_bbox = ref_bboxes[i]
+            gen_bbox = gen_bboxes[i]
+
+            if ref_bbox is None or gen_bbox is None:
+                continue
+
+            # Crop and preprocess faces
+            ref_face = self.crop_and_resize_face(ref_images[i], ref_bbox)
+            gen_face = self.crop_and_resize_face(gen_images[i], gen_bbox)
+
+            ref_face = self.preprocess_face(ref_face)
+            gen_face = self.preprocess_face(gen_face)
+
+            # Extract multi-scale features
+            with torch.no_grad():
+                ref_feats = self.extract_multiscale_features(ref_face)
+            gen_feats = self.extract_multiscale_features(
+                gen_face
+            )  # Gradients flow here!
+
+            # Compute loss for each layer
+            for layer_name in layer_weights.keys():
+                ref_feat = ref_feats[layer_name]
+                gen_feat = gen_feats[layer_name]
+
+                if layer_name == "embedding":
+                    # For embedding: use cosine similarity loss (1 - cos_sim)
+                    ref_norm = F.normalize(ref_feat.flatten(), dim=0)
+                    gen_norm = F.normalize(gen_feat.flatten(), dim=0)
+                    loss = 1.0 - torch.dot(ref_norm, gen_norm)
+                else:
+                    # For spatial features: use normalized MSE loss
+                    # Normalize features for scale invariance
+                    ref_norm = F.normalize(ref_feat.flatten(), dim=0)
+                    gen_norm = F.normalize(gen_feat.flatten(), dim=0)
+                    loss = F.mse_loss(gen_norm, ref_norm)
+
+                layer_losses[layer_name].append(loss)
+
+            valid_indices.append(i)
+
+        if len(valid_indices) == 0:
+            zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            if return_details:
+                return zero_loss, {
+                    k: torch.tensor(0.0, device=device) for k in layer_weights.keys()
+                }
+            return zero_loss
+
+        # Compute weighted total loss
+        loss_dict = {}
+        total_loss = torch.tensor(0.0, device=device)
+
+        for layer_name, weight in layer_weights.items():
+            if layer_losses[layer_name]:
+                layer_loss = torch.stack(layer_losses[layer_name]).mean()
+                loss_dict[layer_name] = layer_loss
+                total_loss = total_loss + weight * layer_loss
+
+        if return_details:
+            return total_loss, loss_dict
+
+        return total_loss
 
 
 # ============================================================================
