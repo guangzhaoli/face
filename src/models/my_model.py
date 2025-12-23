@@ -69,6 +69,7 @@ class InsertAnything(L.LightningModule):
             arcface_weights = model_config.get("arcface_weights", None)
             arcface_model = model_config.get("arcface_model", "r50")  # r50 or r100
             arcface_root = model_config.get("arcface_root", None)
+            self.face_align_mode = model_config.get("face_align_mode", "bbox")
 
             # Multi-scale layer weights (deeper = more identity-related)
             # Total effective weight ~2.0 (0.1+0.2+0.3+0.4+1.0)
@@ -88,12 +89,13 @@ class InsertAnything(L.LightningModule):
                 pretrained_path=arcface_weights,
                 device=device,
                 root=arcface_root,
+                align_mode=self.face_align_mode,
             )
             loss_type = (
                 "Multi-Scale" if self.use_multiscale_face_loss else "Single-Scale"
             )
             print(
-                f"[InsertAnything] {loss_type} Face Loss enabled with weight {self.face_loss_weight}"
+                f"[InsertAnything] {loss_type} Face Loss enabled with weight {self.face_loss_weight}, align {self.face_align_mode}"
             )
 
         if self.use_face_loss:

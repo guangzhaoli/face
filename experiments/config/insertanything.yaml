@@ -15,7 +15,8 @@ model:
     layer3: 0.3    # 细节特征 (眼鼻嘴, 14x14)
     layer4: 0.4    # 高层语义特征 (7x7)
     embedding: 1.0 # 最终身份向量 (最重要)
-  arcface_model: "r100"                     # r50 或 r100
+  arcface_model: "r100"  # r50 或 r100
+  face_align_mode: "bbox" # kps or  bbox                   
   arcface_weights: "/inspire/hdd/project/multimodal-discrete-diffusion/liuxiaohong-25080/guangzhaoli/face/model/arcface/backbone.pth"  # 需下载 PyTorch 权重
 
 train:
