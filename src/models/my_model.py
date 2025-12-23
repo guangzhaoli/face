@@ -339,11 +339,12 @@ class InsertAnything(L.LightningModule):
         total_loss = mse_loss
 
         if self.use_face_loss and data_type is not None:
-            # Check if any sample in batch is person_head (face data)
+            # Check if any sample in batch is face-related data
+            face_types = ("person_head", "person")
             is_face_batch = (
-                any(dt == "person_head" for dt in data_type)
+                any(dt in face_types for dt in data_type)
                 if isinstance(data_type, (list, tuple))
-                else data_type == "person_head"
+                else data_type in face_types
             )
 
             if is_face_batch:

@@ -175,7 +175,7 @@ Face Loss **仅对 `data_type == "person_head"` 的数据生效**：
 
 | data_type | 是否计算 Face Loss |
 |-----------|-------------------|
-| `person` | ❌ 不计算 |
+| `person` | ✅ 计算 |
 | `person_head` | ✅ 计算 |
 | `person_hair` | ❌ 不计算 |
 | 其他 | ❌ 不计算 |
