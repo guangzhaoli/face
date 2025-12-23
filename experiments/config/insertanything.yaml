@@ -8,6 +8,7 @@ model:
   latent_lora: false
   use_face_loss: true
   face_loss_weight: 1
+  face_align_mode: "bbox"                   # "bbox" or "kps"
   arcface_model: "r100"                     # r50 或 r100
   arcface_weights: "/inspire/hdd/project/multimodal-discrete-diffusion/liuxiaohong-25080/guangzhaoli/face/model/arcface/backbone.pth"  # 需下载 PyTorch 权重
 

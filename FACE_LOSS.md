@@ -163,6 +163,7 @@ with torch.no_grad():
 model:
   use_face_loss: true              # 启用人脸损失
   face_loss_weight: 0.1            # 损失权重
+  face_align_mode: "bbox"          # "bbox" 或 "kps" (关键点对齐)
   face_loss_type: "differentiable" # 使用可微分版本
   arcface_weights: "path/to/backbone.pth"
   arcface_model: "r50"             # r50 或 r100
@@ -180,6 +181,13 @@ Face Loss **仅对 `data_type == "person_head"` 的数据生效**：
 | 其他 | ❌ 不计算 |
 
 ---
+
+## 对齐方式（可选）
+
+- `face_align_mode: "bbox"`：基于人脸框裁剪 + resize（当前默认行为）
+- `face_align_mode: "kps"`：基于 5 点关键点做相似变换对齐，再送入 ArcFace
+
+关键点对齐对姿态/旋转更稳，通常能提升身份一致性；若关键点失败会自动回退到 bbox。
 
 ## 技术原理
 

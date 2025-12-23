@@ -279,6 +279,7 @@ class DifferentiableFaceLoss(nn.Module):
         device: str = "cuda",
         det_size: Tuple[int, int] = (640, 640),
         root: Optional[str] = None,
+        align_mode: str = "bbox",  # "bbox" or "kps"
     ):
         """
         Initialize differentiable face loss.
@@ -291,11 +292,13 @@ class DifferentiableFaceLoss(nn.Module):
             device: Device to run on ("cuda" or "cpu")
             det_size: Face detection size (for InsightFace detector)
             root: Root directory for model storage
+            align_mode: Face alignment mode ("bbox" or "kps")
         """
         super().__init__()
         self.device = device
         self.det_size = det_size
         self.root = root
+        self.align_mode = self._normalize_align_mode(align_mode)
 
         # Initialize face recognition model (differentiable)
         if model_name == "r50":
@@ -334,6 +337,18 @@ class DifferentiableFaceLoss(nn.Module):
         # ArcFace input size
         self.face_size = 112
 
+        # ArcFace 112x112 landmark template (InsightFace default)
+        self.kps_template = np.array(
+            [
+                [38.2946, 51.6963],
+                [73.5318, 51.5014],
+                [56.0252, 71.7366],
+                [41.5493, 92.3655],
+                [70.7299, 92.2041],
+            ],
+            dtype=np.float32,
+        )
+
         # Store expected dtype for input conversion
         self._model_dtype = torch.float32
 
@@ -358,22 +373,31 @@ class DifferentiableFaceLoss(nn.Module):
             print("Warning: InsightFace not available. Face detection will not work.")
             self._detector_initialized = True
 
+    def _normalize_align_mode(self, align_mode: str) -> str:
+        if align_mode not in ("bbox", "kps"):
+            print(
+                f"Warning: Unknown align_mode '{align_mode}', falling back to 'bbox'."
+            )
+            return "bbox"
+        return align_mode
+
     @torch.no_grad()
     def detect_faces(self, images: torch.Tensor) -> list:
         """
-        Detect faces in images and return bounding boxes.
+        Detect faces in images and return face info.
 
         Args:
             images: (B, C, H, W) tensor, values in [0, 1]
 
         Returns:
-            List of face bboxes for each image, or None if no face detected
+            List of face info dicts {"bbox": np.ndarray, "kps": np.ndarray},
+            or None if no face detected
         """
         self._init_detector()
         if self._detector is None:
             return [None] * images.shape[0]
 
-        batch_bboxes = []
+        batch_faces = []
         for i in range(images.shape[0]):
             img = images[i]
             # Convert to numpy BGR
@@ -388,11 +412,16 @@ class DifferentiableFaceLoss(nn.Module):
                 # Get the most confident face
                 face = max(faces, key=lambda x: x.det_score)
                 bbox = face.bbox.astype(int)
-                batch_bboxes.append(bbox)
+                kps = getattr(face, "kps", None)
+                if kps is not None:
+                    kps = kps.astype(np.float32)
+                    if kps.shape != (5, 2):
+                        kps = None
+                batch_faces.append({"bbox": bbox, "kps": kps})
             else:
-                batch_bboxes.append(None)
+                batch_faces.append(None)
 
-        return batch_bboxes
+        return batch_faces
 
     def crop_and_resize_face(
         self,
@@ -454,6 +483,135 @@ class DifferentiableFaceLoss(nn.Module):
 
         return face
 
+    def _affine_to_theta(
+        self,
+        affine: torch.Tensor,
+        in_size: Tuple[int, int],
+        out_size: Tuple[int, int],
+        align_corners: bool = False,
+    ) -> torch.Tensor:
+        """Convert pixel-space affine to normalized affine for grid_sample."""
+        in_h, in_w = in_size
+        out_h, out_w = out_size
+        device = affine.device
+        dtype = affine.dtype
+
+        affine_3x3 = torch.eye(3, device=device, dtype=dtype)
+        affine_3x3[:2, :] = affine
+
+        if align_corners:
+            t_out = torch.tensor(
+                [
+                    [(out_w - 1) / 2, 0.0, (out_w - 1) / 2],
+                    [0.0, (out_h - 1) / 2, (out_h - 1) / 2],
+                    [0.0, 0.0, 1.0],
+                ],
+                device=device,
+                dtype=dtype,
+            )
+            t_in = torch.tensor(
+                [
+                    [2.0 / (in_w - 1), 0.0, -1.0],
+                    [0.0, 2.0 / (in_h - 1), -1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            t_out = torch.tensor(
+                [
+                    [out_w / 2.0, 0.0, (out_w - 1) / 2.0],
+                    [0.0, out_h / 2.0, (out_h - 1) / 2.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                device=device,
+                dtype=dtype,
+            )
+            t_in = torch.tensor(
+                [
+                    [2.0 / in_w, 0.0, (1.0 / in_w) - 1.0],
+                    [0.0, 2.0 / in_h, (1.0 / in_h) - 1.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                device=device,
+                dtype=dtype,
+            )
+
+        theta = t_in @ affine_3x3 @ t_out
+        return theta[:2, :]
+
+    def _warp_affine(
+        self,
+        image: torch.Tensor,
+        affine: np.ndarray,
+        out_size: Tuple[int, int],
+    ) -> torch.Tensor:
+        """Warp image with affine (pixel space) using grid_sample."""
+        out_h, out_w = out_size
+        c, h, w = image.shape
+        device = image.device
+        dtype = image.dtype
+
+        affine_t = torch.tensor(affine, device=device, dtype=dtype)
+        theta = self._affine_to_theta(
+            affine_t, (h, w), (out_h, out_w), align_corners=False
+        )
+        grid = F.affine_grid(
+            theta.unsqueeze(0),
+            [1, c, out_h, out_w],
+            align_corners=False,
+        )
+        warped = F.grid_sample(
+            image.unsqueeze(0),
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        return warped.squeeze(0)
+
+    def align_face_by_kps(
+        self,
+        image: torch.Tensor,
+        kps: Optional[np.ndarray],
+    ) -> Optional[torch.Tensor]:
+        """Align face using keypoints and similarity transform."""
+        if kps is None or kps.shape != (5, 2):
+            return None
+
+        estimate = cv2.estimateAffinePartial2D(
+            kps.astype(np.float32), self.kps_template, method=cv2.LMEDS
+        )
+        if estimate is None:
+            return None
+
+        affine = estimate[0]
+        if affine is None:
+            return None
+
+        affine_inv = cv2.invertAffineTransform(affine)
+        return self._warp_affine(image, affine_inv, (self.face_size, self.face_size))
+
+    def extract_face(
+        self,
+        image: torch.Tensor,
+        face_info: Optional[dict],
+    ) -> Optional[torch.Tensor]:
+        """Extract aligned/cropped face based on current align_mode."""
+        if face_info is None:
+            return None
+
+        if self.align_mode == "kps":
+            aligned = self.align_face_by_kps(image, face_info.get("kps"))
+            if aligned is not None:
+                return aligned
+
+        bbox = face_info.get("bbox")
+        if bbox is None:
+            return None
+        return self.crop_and_resize_face(image, bbox)
+
     def preprocess_face(self, face: torch.Tensor) -> torch.Tensor:
         """
         Preprocess face for ArcFace model.
@@ -511,22 +669,24 @@ class DifferentiableFaceLoss(nn.Module):
         device = gen_images.device
 
         # Detect faces in both reference and generated images
-        ref_bboxes = self.detect_faces(ref_images)
-        gen_bboxes = self.detect_faces(gen_images)
+        ref_faces = self.detect_faces(ref_images)
+        gen_faces = self.detect_faces(gen_images)
 
         losses = []
         valid_indices = []
 
         for i in range(batch_size):
-            ref_bbox = ref_bboxes[i]
-            gen_bbox = gen_bboxes[i]
+            ref_info = ref_faces[i]
+            gen_info = gen_faces[i]
 
-            if ref_bbox is None or gen_bbox is None:
+            if ref_info is None or gen_info is None:
                 continue
 
-            # Crop and preprocess faces
-            ref_face = self.crop_and_resize_face(ref_images[i], ref_bbox)
-            gen_face = self.crop_and_resize_face(gen_images[i], gen_bbox)
+            # Crop/align and preprocess faces
+            ref_face = self.extract_face(ref_images[i], ref_info)
+            gen_face = self.extract_face(gen_images[i], gen_info)
+            if ref_face is None or gen_face is None:
+                continue
 
             ref_face = self.preprocess_face(ref_face)
             gen_face = self.preprocess_face(gen_face)
@@ -636,23 +796,25 @@ class DifferentiableFaceLoss(nn.Module):
         device = gen_images.device
 
         # Detect faces
-        ref_bboxes = self.detect_faces(ref_images)
-        gen_bboxes = self.detect_faces(gen_images)
+        ref_faces = self.detect_faces(ref_images)
+        gen_faces = self.detect_faces(gen_images)
 
         # Accumulate losses per layer
         layer_losses = {k: [] for k in layer_weights.keys()}
         valid_indices = []
 
         for i in range(batch_size):
-            ref_bbox = ref_bboxes[i]
-            gen_bbox = gen_bboxes[i]
+            ref_info = ref_faces[i]
+            gen_info = gen_faces[i]
 
-            if ref_bbox is None or gen_bbox is None:
+            if ref_info is None or gen_info is None:
                 continue
 
-            # Crop and preprocess faces
-            ref_face = self.crop_and_resize_face(ref_images[i], ref_bbox)
-            gen_face = self.crop_and_resize_face(gen_images[i], gen_bbox)
+            # Crop/align and preprocess faces
+            ref_face = self.extract_face(ref_images[i], ref_info)
+            gen_face = self.extract_face(gen_images[i], gen_info)
+            if ref_face is None or gen_face is None:
+                continue
 
             ref_face = self.preprocess_face(ref_face)
             gen_face = self.preprocess_face(gen_face)
@@ -1041,6 +1203,7 @@ class DifferentiableFaceLossWrapper(nn.Module):
         image_size: int = 768,
         device: str = "cuda",
         root: str = None,
+        align_mode: str = "bbox",
     ):
         """
         Initialize differentiable face loss wrapper.
@@ -1053,6 +1216,7 @@ class DifferentiableFaceLossWrapper(nn.Module):
             image_size: Size of individual images (diptych is 2x this width)
             device: Device to run on ("cuda" or "cpu")
             root: Root directory for InsightFace detector model storage
+            align_mode: Face alignment mode ("bbox" or "kps")
         """
         super().__init__()
         self.vae = vae
@@ -1061,6 +1225,7 @@ class DifferentiableFaceLossWrapper(nn.Module):
             pretrained_path=arcface_weights_path,
             device=device,
             root=root,
+            align_mode=align_mode,
         )
         self.image_size = image_size
 
