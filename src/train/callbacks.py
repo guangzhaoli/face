@@ -13,6 +13,10 @@ try:
     import wandb
 except ImportError:
     wandb = None
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 
 def f(r, T=0.6, beta=0.1):
     return np.where(r < T, beta + (1 - beta) / T * r, 1)
@@ -156,6 +160,21 @@ class TrainingCallback(L.Callback):
             wandb is not None and os.environ.get("WANDB_API_KEY") is not None
         )
 
+        self.tensorboard_config = training_config.get("tensorboard", {})
+        self.use_tensorboard = self.tensorboard_config.get("enabled", True)
+        self.tensorboard_log_interval = self.tensorboard_config.get(
+            "log_interval", self.print_every_n_steps
+        )
+        self.tensorboard_writer = None
+        if self.use_tensorboard and SummaryWriter is not None:
+            log_dir = self.tensorboard_config.get(
+                "log_dir", f"{self.save_path}/{self.run_name}/tensorboard"
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            self.tensorboard_writer = SummaryWriter(log_dir=log_dir)
+        elif self.use_tensorboard:
+            print("Warning: TensorBoard not available. Install tensorboard to enable logging.")
+
         self.total_steps = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -173,6 +192,15 @@ class TrainingCallback(L.Callback):
         self.total_steps += 1
 
         # Print training progress every n steps
+        loss_value = None
+        if outputs is not None:
+            if isinstance(outputs, dict) and "loss" in outputs:
+                loss_value = outputs["loss"].item()
+            elif torch.is_tensor(outputs):
+                loss_value = outputs.item()
+            if loss_value is not None:
+                loss_value *= trainer.accumulate_grad_batches
+
         if self.use_wandb:
             report_dict = {
                 "steps": batch_idx,
@@ -180,10 +208,20 @@ class TrainingCallback(L.Callback):
                 "epoch": trainer.current_epoch,
                 "gradient_size": gradient_size,
             }
-            loss_value = outputs["loss"].item() * trainer.accumulate_grad_batches
-            report_dict["loss"] = loss_value
+            if loss_value is not None:
+                report_dict["loss"] = loss_value
             report_dict["t"] = pl_module.last_t
             wandb.log(report_dict)
+
+        if self.tensorboard_writer is not None and loss_value is not None:
+            if self.total_steps % self.tensorboard_log_interval == 0:
+                self.tensorboard_writer.add_scalar(
+                    "loss/total", loss_value, self.total_steps
+                )
+                if hasattr(pl_module, "log_face_loss"):
+                    self.tensorboard_writer.add_scalar(
+                        "loss/face", pl_module.log_face_loss, self.total_steps
+                    )
 
         if self.total_steps % self.print_every_n_steps == 0:
             print(
@@ -211,6 +249,11 @@ class TrainingCallback(L.Callback):
                 f"{self.save_path}/{self.run_name}/output_diptych",
                 f"lora_{self.total_steps}",
             )
+
+    def on_train_end(self, trainer, pl_module):
+        if self.tensorboard_writer is not None:
+            self.tensorboard_writer.close()
+            self.tensorboard_writer = None
 
     @torch.no_grad()
     def generate_a_sample(
