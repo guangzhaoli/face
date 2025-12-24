@@ -58,3 +58,7 @@ outputs/
 data/
 result/
 examples/
+
+result_*
+result_*/
+runs/
