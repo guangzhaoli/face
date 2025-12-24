@@ -1,4 +1,4 @@
-export XFL_CONFIG=/inspire/hdd/project/multimodal-discrete-diffusion/liuxiaohong-25080/guangzhaoli/face/experiments/config/insertanything.yaml
+export XFL_CONFIG=experiments/config/insertanything.yaml
 
 echo $XFL_CONFIG
 export TOKENIZERS_PARALLELISM=true
