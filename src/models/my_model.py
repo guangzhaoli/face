@@ -165,6 +165,12 @@ class InsertAnything(L.LightningModule):
                 if not hasattr(self, "log_face_loss")
                 else self.log_face_loss * 0.95 + face_loss.item() * 0.05
             )
+            t_weight = (1 - self.last_t) ** 2
+            self.log_t_weight = (
+                t_weight
+                if not hasattr(self, "log_t_weight")
+                else self.log_t_weight * 0.95 + t_weight * 0.05
+            )
         return step_loss
 
     def unpack_latents(
@@ -390,7 +396,14 @@ class InsertAnything(L.LightningModule):
                         # Single-scale loss: only uses final identity embedding
                         face_loss = self.face_loss(ref.float(), pred_target.float())
 
-                    total_loss = mse_loss + self.face_loss_weight * face_loss
+                    # T-aware weighting: face loss is more meaningful at low t
+                    # t close to 0: x_0_hat ≈ x_0, high quality prediction
+                    # t close to 1: x_0_hat is noisy, low quality prediction
+                    # Use (1-t)^2 for smooth decay: t=0 -> 1.0, t=0.5 -> 0.25, t=1 -> 0
+                    t_weight = ((1 - t.mean()) ** 2).clamp(0, 1)
+                    effective_face_weight = self.face_loss_weight * t_weight
+
+                    total_loss = mse_loss + effective_face_weight * face_loss
 
                 except Exception as e:
                     # If face detection fails, just use MSE loss
