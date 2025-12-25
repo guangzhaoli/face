@@ -135,7 +135,7 @@ def main():
     # 保存本次运行的配置到输出目录，便于复现
     save_path = training_config.get("save_path", "./output")
     if is_main_process:
-        os.makedirs(f"{save_path}/{run_name}")
+        os.makedirs(f"{save_path}/{run_name}", exist_ok=True)
         with open(f"{save_path}/{run_name}/config.yaml", "w") as f:
             yaml.dump(config, f)
 

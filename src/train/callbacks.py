@@ -5,6 +5,7 @@ from transformers import pipeline
 import cv2
 import torch
 import os
+from torch.utils.tensorboard import SummaryWriter
 from ..models.pipeline_tools import encode_images, prepare_text_input
 import json
 import math
@@ -156,6 +157,17 @@ class TrainingCallback(L.Callback):
             wandb is not None and os.environ.get("WANDB_API_KEY") is not None
         )
 
+        # TensorBoard setup
+        self.tensorboard_config = training_config.get("tensorboard", {})
+        self.use_tensorboard = self.tensorboard_config.get("enabled", False)
+        self.log_interval = self.tensorboard_config.get("log_interval", 10)
+        
+        if self.use_tensorboard:
+            # Use 'runs' directory by default if save_path is not set, or create a specific tensorboard dir
+            tb_log_dir = os.path.join(self.save_path, self.run_name, "tensorboard")
+            self.writer = SummaryWriter(log_dir=tb_log_dir)
+            print(f"TensorBoard logging enabled. Logs will be saved to {tb_log_dir}")
+
         self.total_steps = 0
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
@@ -184,6 +196,30 @@ class TrainingCallback(L.Callback):
             report_dict["loss"] = loss_value
             report_dict["t"] = pl_module.last_t
             wandb.log(report_dict)
+
+        # TensorBoard logging
+        if self.use_tensorboard and self.total_steps % self.log_interval == 0:
+            loss_value = outputs["loss"].item() * trainer.accumulate_grad_batches
+            self.writer.add_scalar("Train/Loss", loss_value, self.total_steps)
+            self.writer.add_scalar("Train/Gradient_Size", gradient_size, self.total_steps)
+            self.writer.add_scalar("Train/Max_Gradient_Size", max_gradient_size, self.total_steps)
+            self.writer.add_scalar("Train/Timestep_t", pl_module.last_t, self.total_steps)
+            self.writer.add_scalar("Train/Epoch", trainer.current_epoch, self.total_steps)
+            
+            # Log face loss if available
+            if hasattr(pl_module, "log_face_loss"):
+                self.writer.add_scalar("Train/Face_Loss", pl_module.log_face_loss, self.total_steps)
+
+            # Log learning rate
+            optimizers = trainer.optimizers
+            if isinstance(optimizers, list):
+                 optimizer = optimizers[0]
+            else:
+                optimizer = optimizers
+            
+            if optimizer is not None:
+                 for i, param_group in enumerate(optimizer.param_groups):
+                    self.writer.add_scalar(f"Train/LR_group_{i}", param_group['lr'], self.total_steps)
 
         if self.total_steps % self.print_every_n_steps == 0:
             print(
