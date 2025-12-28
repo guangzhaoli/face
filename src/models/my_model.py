@@ -5,6 +5,9 @@ from peft import LoraConfig, get_peft_model_state_dict
 
 import prodigyopt
 from PIL import Image
+import os
+import cv2
+import numpy as np
 from .transformer import tranformer_forward
 from .pipeline_tools import (
     encode_images,
@@ -13,6 +16,96 @@ from .pipeline_tools import (
 )
 from .image_project import image_output
 from .arcface_loss import DifferentiableFaceLoss
+
+
+def debug_save_face_detection(
+    ref: torch.Tensor,
+    pred_target: torch.Tensor,
+    t_value: float,
+    step: int,
+    face_loss_module,
+    save_dir: str = "debug_face_detection",
+):
+    """
+    保存人脸检测调试图像。
+
+    Args:
+        ref: 参考图像 (B, C, H, W), [0, 1]
+        pred_target: 预测的目标图像 (B, C, H, W), [0, 1]
+        t_value: 当前时间步 t
+        step: 训练步数
+        face_loss_module: DifferentiableFaceLoss 实例
+        save_dir: 保存目录
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    batch_size = ref.shape[0]
+
+    # 检测人脸
+    with torch.no_grad():
+        ref_faces = face_loss_module.detect_faces(ref.float())
+        pred_faces = face_loss_module.detect_faces(pred_target.float())
+
+    for i in range(min(batch_size, 2)):  # 只保存前2个样本
+        # 转换为 numpy (H, W, C), [0, 255]
+        ref_np = (ref[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        pred_np = (pred_target[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+        # 转为 BGR (OpenCV 格式)
+        ref_bgr = cv2.cvtColor(ref_np, cv2.COLOR_RGB2BGR)
+        pred_bgr = cv2.cvtColor(pred_np, cv2.COLOR_RGB2BGR)
+
+        # 在图像上绘制检测框
+        ref_status = "NO_FACE"
+        pred_status = "NO_FACE"
+
+        if ref_faces[i] is not None:
+            bbox = ref_faces[i]["bbox"]
+            cv2.rectangle(
+                ref_bgr, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2
+            )
+            ref_status = "DETECTED"
+
+        if pred_faces[i] is not None:
+            bbox = pred_faces[i]["bbox"]
+            cv2.rectangle(
+                pred_bgr, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 2
+            )
+            pred_status = "DETECTED"
+
+        # 添加文字标注
+        cv2.putText(
+            ref_bgr,
+            f"REF: {ref_status}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            pred_bgr,
+            f"PRED: {pred_status} | t={t_value:.3f}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 0),
+            2,
+        )
+
+        # 拼接图像
+        combined = np.hstack([ref_bgr, pred_bgr])
+
+        # 保存
+        filename = f"step{step:06d}_batch{i}_t{t_value:.3f}_ref{ref_status}_pred{pred_status}.jpg"
+        cv2.imwrite(os.path.join(save_dir, filename), combined)
+
+    # 打印统计
+    ref_detected = sum(1 for f in ref_faces if f is not None)
+    pred_detected = sum(1 for f in pred_faces if f is not None)
+    print(
+        f"[DEBUG] Step {step}, t={t_value:.3f}: ref {ref_detected}/{batch_size}, pred {pred_detected}/{batch_size}"
+    )
 
 
 class InsertAnything(L.LightningModule):
@@ -398,6 +491,22 @@ class InsertAnything(L.LightningModule):
                         # Extract target region (right half of diptych)
                         target_width = pred_images.shape[3] // 2
                         pred_target = pred_images[..., target_width:]  # Right half
+
+                        # DEBUG: 保存检测调试图像 (每100步保存一次)
+                        if hasattr(self, "_debug_step_counter"):
+                            self._debug_step_counter += 1
+                        else:
+                            self._debug_step_counter = 0
+
+                        if self._debug_step_counter % 100 == 0:
+                            debug_save_face_detection(
+                                ref=ref,
+                                pred_target=pred_target,
+                                t_value=t.mean().item(),
+                                step=self._debug_step_counter,
+                                face_loss_module=self.face_loss,
+                                save_dir="debug_face_detection",
+                            )
 
                         # Compute differentiable face loss
                         # ref is the reference face image (ground truth)
