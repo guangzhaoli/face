@@ -286,10 +286,10 @@ class DifferentiableFaceLoss(nn.Module):
 
         Args:
             model_name: Model architecture ("r50" or "r100")
-            pretrained_path: Path to pretrained weights (.pt or .pth file).
+            pretrained_path: Path to pretrained weights (.pt or .pth file). REQUIRED.
                            Download from: https://github.com/deepinsight/insightface/tree/master/recognition/arcface_torch
-                           If None, will try to load from default location.
-            device: Device to run on ("cuda" or "cpu")
+                           Raises RuntimeError if file not found.
+            device: Device to run on ("cuda", "cuda:0", "cpu", or torch.device)
             det_size: Face detection size (for InsightFace detector)
             root: Root directory for model storage
             align_mode: Face alignment mode ("bbox" or "kps")
@@ -314,11 +314,10 @@ class DifferentiableFaceLoss(nn.Module):
             self.recognizer.load_state_dict(state_dict)
             print(f"Loaded pretrained ArcFace weights from {pretrained_path}")
         else:
-            print(
-                f"Warning: No pretrained weights loaded. Face embeddings will be random."
-            )
-            print(
-                f"Download weights from: https://github.com/deepinsight/insightface/tree/master/recognition/arcface_torch"
+            raise RuntimeError(
+                f"ArcFace weights not found at '{pretrained_path}'. "
+                f"Face loss requires pretrained weights. "
+                f"Download from: https://github.com/deepinsight/insightface/tree/master/recognition/arcface_torch"
             )
 
         # IMPORTANT: Always keep recognizer in float32
@@ -352,6 +351,34 @@ class DifferentiableFaceLoss(nn.Module):
         # Store expected dtype for input conversion
         self._model_dtype = torch.float32
 
+    def _parse_device_id(self) -> int:
+        """Parse GPU device index from device string or torch.device."""
+        device = self.device
+
+        # Handle torch.device objects
+        if isinstance(device, torch.device):
+            if device.type == "cuda":
+                return device.index if device.index is not None else 0
+            return -1  # CPU
+
+        # Handle string devices
+        if isinstance(device, str):
+            if device == "cpu":
+                return -1
+            if device == "cuda" or device == "cuda:0":
+                return 0
+            if device.startswith("cuda:"):
+                try:
+                    return int(device.split(":")[1])
+                except (ValueError, IndexError):
+                    return 0
+
+        # Handle int (direct GPU index)
+        if isinstance(device, int):
+            return device if device >= 0 else -1
+
+        return -1  # Default to CPU
+
     def _init_detector(self):
         """Lazy initialization of face detector."""
         if self._detector_initialized:
@@ -365,9 +392,8 @@ class DifferentiableFaceLoss(nn.Module):
                 root=self.root,
                 providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
             )
-            self._detector.prepare(
-                ctx_id=0 if self.device == "cuda" else -1, det_size=self.det_size
-            )
+            ctx_id = self._parse_device_id()
+            self._detector.prepare(ctx_id=ctx_id, det_size=self.det_size)
             self._detector_initialized = True
         except ImportError:
             print("Warning: InsightFace not available. Face detection will not work.")
@@ -831,17 +857,11 @@ class DifferentiableFaceLoss(nn.Module):
                 ref_feat = ref_feats[layer_name]
                 gen_feat = gen_feats[layer_name]
 
-                if layer_name == "embedding":
-                    # For embedding: use cosine similarity loss (1 - cos_sim)
-                    ref_norm = F.normalize(ref_feat.flatten(), dim=0)
-                    gen_norm = F.normalize(gen_feat.flatten(), dim=0)
-                    loss = 1.0 - torch.dot(ref_norm, gen_norm)
-                else:
-                    # For spatial features: use normalized MSE loss
-                    # Normalize features for scale invariance
-                    ref_norm = F.normalize(ref_feat.flatten(), dim=0)
-                    gen_norm = F.normalize(gen_feat.flatten(), dim=0)
-                    loss = F.mse_loss(gen_norm, ref_norm)
+                # Use cosine distance for all layers (not MSE)
+                # MSE on flattened normalized vectors is numerically squashed by 1/N
+                ref_norm = F.normalize(ref_feat.flatten(), dim=0)
+                gen_norm = F.normalize(gen_feat.flatten(), dim=0)
+                loss = 1.0 - torch.dot(ref_norm, gen_norm)
 
                 layer_losses[layer_name].append(loss)
 
@@ -850,9 +870,12 @@ class DifferentiableFaceLoss(nn.Module):
         if len(valid_indices) == 0:
             zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
             if return_details:
-                return zero_loss, {
-                    k: torch.tensor(0.0, device=device) for k in layer_weights.keys()
-                }
+                valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                return (
+                    zero_loss,
+                    {k: torch.tensor(0.0, device=device) for k in layer_weights.keys()},
+                    valid_mask,
+                )
             return zero_loss
 
         # Compute weighted total loss
@@ -866,7 +889,9 @@ class DifferentiableFaceLoss(nn.Module):
                 total_loss = total_loss + weight * layer_loss
 
         if return_details:
-            return total_loss, loss_dict
+            valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            valid_mask[valid_indices] = True
+            return total_loss, loss_dict, valid_mask
 
         return total_loss
 

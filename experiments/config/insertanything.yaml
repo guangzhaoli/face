@@ -9,6 +9,7 @@ model:
   use_face_loss: true
   use_multiscale_face_loss: true
   face_loss_weight: 0.5
+  use_t_aware_weighting: true
   multiscale_layer_weights:
     layer1: 0.1    # 粗粒度人脸结构 (56x56)
     layer2: 0.2    # 中层特征 (28x28)

@@ -61,6 +61,7 @@ class InsertAnything(L.LightningModule):
 
         # Initialize face loss for face identity preservation
         self.use_face_loss = model_config.get("use_face_loss", False)
+        self.use_t_aware_weighting = model_config.get("use_t_aware_weighting", True)
         self.use_multiscale_face_loss = model_config.get(
             "use_multiscale_face_loss", True
         )
@@ -159,18 +160,25 @@ class InsertAnything(L.LightningModule):
             if not hasattr(self, "log_loss")
             else self.log_loss * 0.95 + step_loss.item() * 0.05
         )
+
         if face_loss is not None:
+            face_loss_value = face_loss.item()
             self.log_face_loss = (
-                face_loss.item()
+                face_loss_value
                 if not hasattr(self, "log_face_loss")
-                else self.log_face_loss * 0.95 + face_loss.item() * 0.05
+                else self.log_face_loss * 0.95 + face_loss_value * 0.05
             )
-            t_weight = (1 - self.last_t) ** 2
+            # Use the exact t_weight from step() for consistency
+            t_weight = getattr(self, "last_t_weight", 1.0)
             self.log_t_weight = (
                 t_weight
                 if not hasattr(self, "log_t_weight")
                 else self.log_t_weight * 0.95 + t_weight * 0.05
             )
+            self.log_face_loss_computed = True
+        else:
+            self.log_face_loss_computed = False
+
         return step_loss
 
     def unpack_latents(
@@ -344,70 +352,101 @@ class InsertAnything(L.LightningModule):
         face_loss = None
         total_loss = mse_loss
 
-        if self.use_face_loss and data_type is not None:
-            # Check if any sample in batch is face-related data
-            face_types = ("person_head", "person")
-            is_face_batch = (
-                any(dt in face_types for dt in data_type)
-                if isinstance(data_type, (list, tuple))
-                else data_type in face_types
-            )
+        # Track face loss skip reasons for monitoring
+        self.face_loss_skipped_no_data_type = False
+        self.face_loss_skipped_not_face = False
+        self.face_loss_detection_failed = False
 
-            if is_face_batch:
-                try:
-                    # ========== Differentiable Face Loss Computation ==========
-                    #
-                    # Flow Matching: x_t = (1-t) * x_0 + t * x_1
-                    # Velocity: v = x_1 - x_0
-                    # Therefore: x_0 = x_t - t * v = x_t - t * pred
-                    #
-                    # We estimate x_0 from the model's velocity prediction,
-                    # then decode to pixel space and compute face loss.
-                    # This allows gradients to flow back through the prediction.
-                    # ===========================================================
+        if self.use_face_loss:
+            if data_type is None:
+                self.face_loss_skipped_no_data_type = True
+            else:
+                # Check if any sample in batch is face-related data
+                face_types = ("person_head", "person")
+                is_face_batch = (
+                    any(dt in face_types for dt in data_type)
+                    if isinstance(data_type, (list, tuple))
+                    else data_type in face_types
+                )
 
-                    # Estimate x_0 from velocity prediction (differentiable)
-                    x_0_hat = x_t - t_ * pred
+                if not is_face_batch:
+                    self.face_loss_skipped_not_face = True
+                else:
+                    try:
+                        # ========== Differentiable Face Loss Computation ==========
+                        #
+                        # Flow Matching: x_t = (1-t) * x_0 + t * x_1
+                        # Velocity: v = x_1 - x_0
+                        # Therefore: x_0 = x_t - t * v = x_t - t * pred
+                        #
+                        # We estimate x_0 from the model's velocity prediction,
+                        # then decode to pixel space and compute face loss.
+                        # This allows gradients to flow back through the prediction.
+                        # ===========================================================
 
-                    # Unpack latents from transformer format to VAE format
-                    x_0_unpacked = self.unpack_latents(
-                        x_0_hat, latent_height, latent_width
-                    )
+                        # Estimate x_0 from velocity prediction (differentiable)
+                        x_0_hat = x_t - t_ * pred
 
-                    # Decode to pixel space (differentiable)
-                    pred_images = self.decode_latents(x_0_unpacked)
-
-                    # Extract target region (right half of diptych)
-                    target_width = pred_images.shape[3] // 2
-                    pred_target = pred_images[..., target_width:]  # Right half
-
-                    # Compute differentiable face loss
-                    # ref is the reference face image (ground truth)
-                    # pred_target is the model's prediction (gradients flow through here)
-                    # NOTE: Convert to float32 - numpy in detect_faces doesn't support bfloat16
-                    if self.use_multiscale_face_loss:
-                        # Multi-scale loss: combines features from all layers
-                        face_loss = self.face_loss.forward_multiscale(
-                            ref.float(),
-                            pred_target.float(),
-                            layer_weights=self.multiscale_layer_weights,
+                        # Unpack latents from transformer format to VAE format
+                        x_0_unpacked = self.unpack_latents(
+                            x_0_hat, latent_height, latent_width
                         )
-                    else:
-                        # Single-scale loss: only uses final identity embedding
-                        face_loss = self.face_loss(ref.float(), pred_target.float())
 
-                    # T-aware weighting: face loss is more meaningful at low t
-                    # t close to 0: x_0_hat ≈ x_0, high quality prediction
-                    # t close to 1: x_0_hat is noisy, low quality prediction
-                    # Use (1-t)^2 for smooth decay: t=0 -> 1.0, t=0.5 -> 0.25, t=1 -> 0
-                    t_weight = ((1 - t.mean()) ** 2).clamp(0, 1)
-                    effective_face_weight = self.face_loss_weight * t_weight
+                        # Decode to pixel space (differentiable)
+                        pred_images = self.decode_latents(x_0_unpacked)
 
-                    total_loss = mse_loss + effective_face_weight * face_loss
+                        # Extract target region (right half of diptych)
+                        target_width = pred_images.shape[3] // 2
+                        pred_target = pred_images[..., target_width:]  # Right half
 
-                except Exception as e:
-                    # If face detection fails, just use MSE loss
-                    print(f"[FaceLoss] Warning: {e}")
-                    face_loss = None
+                        # Compute differentiable face loss
+                        # ref is the reference face image (ground truth)
+                        # pred_target is the model's prediction (gradients flow through here)
+                        # NOTE: Convert to float32 - numpy in detect_faces doesn't support bfloat16
+                        if self.use_multiscale_face_loss:
+                            # Multi-scale loss: combines features from all layers
+                            face_loss, loss_dict, valid_mask = (
+                                self.face_loss.forward_multiscale(
+                                    ref.float(),
+                                    pred_target.float(),
+                                    layer_weights=self.multiscale_layer_weights,
+                                    return_details=True,
+                                )
+                            )
+                            # Check if any faces were detected
+                            if not valid_mask.any():
+                                self.face_loss_detection_failed = True
+                                face_loss = None
+                        else:
+                            # Single-scale loss: only uses final identity embedding
+                            face_loss, _, valid_mask = self.face_loss(
+                                ref.float(), pred_target.float(), return_details=True
+                            )
+                            # Check if any faces were detected
+                            if not valid_mask.any():
+                                self.face_loss_detection_failed = True
+                                face_loss = None
+
+                        # Only apply face loss if we have valid detections
+                        if face_loss is not None:
+                            # T-aware weighting: face loss is more meaningful at low t
+                            # t close to 0: x_0_hat ≈ x_0, high quality prediction
+                            # t close to 1: x_0_hat is noisy, low quality prediction
+                            # Use (1-t) with min clamp to preserve some identity signal at high t
+                            if self.use_t_aware_weighting:
+                                t_weight = (1 - t.mean()).clamp(min=0.1, max=1.0)
+                                self.last_t_weight = t_weight.item()
+                            else:
+                                t_weight = 1.0
+                                self.last_t_weight = 1.0
+                            effective_face_weight = self.face_loss_weight * t_weight
+
+                            total_loss = mse_loss + effective_face_weight * face_loss
+
+                    except Exception as e:
+                        # If face detection fails, just use MSE loss
+                        print(f"[FaceLoss] Warning: {e}")
+                        face_loss = None
+                        self.face_loss_detection_failed = True
 
         return total_loss, face_loss
