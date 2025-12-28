@@ -339,12 +339,13 @@ class InsertAnything(L.LightningModule):
         """
         vae = self.flux_fill_pipe.vae
 
-        latents = latents.to(dtype=vae.dtype)
-
+        # Unscale latents
         latents = latents / vae.config.scaling_factor + vae.config.shift_factor
 
+        # Decode
         images = vae.decode(latents).sample
 
+        # Convert from [-1, 1] to [0, 1]
         images = (images + 1) / 2
         images = images.clamp(0, 1)
 

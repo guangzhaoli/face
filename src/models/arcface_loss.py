@@ -351,6 +351,20 @@ class DifferentiableFaceLoss(nn.Module):
         # Store expected dtype for input conversion
         self._model_dtype = torch.float32
 
+    def _apply(self, fn):
+        """
+        Override _apply to keep recognizer in float32.
+
+        When parent module calls .to(dtype=bfloat16), this ensures
+        the recognizer weights stay in float32 for numerical stability.
+        ArcFace was trained in float32 and works best in that precision.
+        """
+        # Apply function to all modules (handles device moves, etc.)
+        super()._apply(fn)
+        # Force recognizer back to float32 after any conversion
+        self.recognizer = self.recognizer.to(dtype=torch.float32)
+        return self
+
     def _parse_device_id(self) -> int:
         """Parse GPU device index from device string or torch.device."""
         device = self.device
