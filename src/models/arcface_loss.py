@@ -439,7 +439,7 @@ class DifferentiableFaceLoss(nn.Module):
 
         batch_faces = []
         for i in range(images.shape[0]):
-            img = images[i]
+            img = images[i].detach()
             # Convert to numpy BGR
             if img.dim() == 3 and img.shape[0] in [1, 3]:
                 img = img.permute(1, 2, 0)

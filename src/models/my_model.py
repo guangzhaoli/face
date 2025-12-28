@@ -48,8 +48,12 @@ def debug_save_face_detection(
 
     for i in range(min(batch_size, 2)):  # 只保存前2个样本
         # 转换为 numpy (H, W, C), [0, 255]
-        ref_np = (ref[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-        pred_np = (pred_target[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        ref_np = (
+            ref[i].detach().permute(1, 2, 0).cpu().numpy() * 255
+        ).astype(np.uint8)
+        pred_np = (
+            pred_target[i].detach().permute(1, 2, 0).cpu().numpy() * 255
+        ).astype(np.uint8)
 
         # 转为 BGR (OpenCV 格式)
         ref_bgr = cv2.cvtColor(ref_np, cv2.COLOR_RGB2BGR)
