@@ -478,7 +478,9 @@ class InsertAnything(L.LightningModule):
                         # ===========================================================
 
                         # Estimate x_0 from velocity prediction (differentiable)
-                        x_0_hat = x_t - t_ * pred
+                        # Keep latent math in VAE dtype to avoid bf16/float mismatch in decode.
+                        t_latent = t_.to(dtype=x_t.dtype)
+                        x_0_hat = (x_t - t_latent * pred).to(dtype=x_t.dtype)
 
                         # Unpack latents from transformer format to VAE format
                         x_0_unpacked = self.unpack_latents(
