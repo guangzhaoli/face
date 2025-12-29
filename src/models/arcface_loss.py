@@ -363,6 +363,11 @@ class DifferentiableFaceLoss(nn.Module):
         super()._apply(fn)
         # Force recognizer back to float32 after any conversion
         self.recognizer = self.recognizer.to(dtype=torch.float32)
+        # Keep internal device in sync after module moves
+        try:
+            self.device = next(self.recognizer.parameters()).device
+        except StopIteration:
+            pass
         return self
 
     def _parse_device_id(self) -> int:
@@ -401,11 +406,13 @@ class DifferentiableFaceLoss(nn.Module):
         try:
             from insightface.app import FaceAnalysis
 
-            self._detector = FaceAnalysis(
-                name="buffalo_l",
-                root=self.root,
-                providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-            )
+            fa_kwargs = {
+                "name": "buffalo_l",
+                "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            }
+            if self.root is not None:
+                fa_kwargs["root"] = self.root
+            self._detector = FaceAnalysis(**fa_kwargs)
             ctx_id = self._parse_device_id()
             self._detector.prepare(ctx_id=ctx_id, det_size=self.det_size)
             self._detector_initialized = True
@@ -679,8 +686,9 @@ class DifferentiableFaceLoss(nn.Module):
         """
         # Ensure face is float32 to match recognizer weights
         # This prevents "Input type (float) and bias type (c10::BFloat16)" warnings
+        recognizer_device = next(self.recognizer.parameters()).device
         face = face.unsqueeze(0).to(
-            device=self.device, dtype=self._model_dtype
+            device=recognizer_device, dtype=self._model_dtype
         )  # (1, C, 112, 112)
         embedding = self.recognizer(face)  # (1, 512)
         return embedding.squeeze(0)
@@ -781,8 +789,9 @@ class DifferentiableFaceLoss(nn.Module):
         Returns:
             Dict with features from each layer and final embedding
         """
+        recognizer_device = next(self.recognizer.parameters()).device
         face = face.unsqueeze(0).to(
-            device=self.device, dtype=self._model_dtype
+            device=recognizer_device, dtype=self._model_dtype
         )  # (1, C, 112, 112)
         features = self.recognizer.forward_multiscale(face)
         # Squeeze batch dimension
@@ -955,11 +964,13 @@ class ArcFaceLoss(nn.Module):
 
         # Initialize InsightFace model
         # If root is specified, use it; otherwise FaceAnalysis uses default ~/.insightface/models/
-        self.app = FaceAnalysis(
-            name=model_name,
-            root=root,
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        )
+        fa_kwargs = {
+            "name": model_name,
+            "providers": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        }
+        if root is not None:
+            fa_kwargs["root"] = root
+        self.app = FaceAnalysis(**fa_kwargs)
         self.app.prepare(ctx_id=ctx_id, det_size=det_size)
 
         # Embedding dimension (512 for ArcFace)
