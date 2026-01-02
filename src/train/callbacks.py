@@ -278,6 +278,49 @@ class TrainingCallback(L.Callback):
                         self.total_steps,
                     )
 
+            # Log LPIPS loss if enabled and available
+            if hasattr(pl_module, "use_lpips_loss") and pl_module.use_lpips_loss:
+                if hasattr(pl_module, "log_lpips_loss"):
+                    self.writer.add_scalar(
+                        "Train/LPIPS_Loss", pl_module.log_lpips_loss, self.total_steps
+                    )
+                    # Log effective LPIPS weight
+                    if hasattr(pl_module, "log_t_weight"):
+                        effective_lpips_weight = (
+                            pl_module.lpips_loss_weight * pl_module.log_t_weight
+                        )
+                        self.writer.add_scalar(
+                            "Train/Effective_LPIPS_Weight",
+                            effective_lpips_weight,
+                            self.total_steps,
+                        )
+
+            # Log SSIM loss if enabled and available
+            if hasattr(pl_module, "use_ssim_loss") and pl_module.use_ssim_loss:
+                if hasattr(pl_module, "log_ssim_loss"):
+                    self.writer.add_scalar(
+                        "Train/SSIM_Loss", pl_module.log_ssim_loss, self.total_steps
+                    )
+                    # Log effective SSIM weight
+                    if hasattr(pl_module, "log_t_weight"):
+                        effective_ssim_weight = (
+                            pl_module.ssim_loss_weight * pl_module.log_t_weight
+                        )
+                        self.writer.add_scalar(
+                            "Train/Effective_SSIM_Weight",
+                            effective_ssim_weight,
+                            self.total_steps,
+                        )
+
+            # Log mask-weighted loss status if enabled
+            if (
+                hasattr(pl_module, "use_mask_weighted_loss")
+                and pl_module.use_mask_weighted_loss
+            ):
+                self.writer.add_scalar(
+                    "Train/Mask_Weighted_Enabled", 1.0, self.total_steps
+                )
+
             # Log learning rate
             optimizers = trainer.optimizers
             if isinstance(optimizers, list):

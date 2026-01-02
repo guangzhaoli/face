@@ -21,6 +21,7 @@ model:
   arcface_model: "r100"
   face_align_mode: "kps"
   arcface_weights: "model/arcface/backbone.pth"
+  arcface_root: "/inspire/ssd/project/project-public/250041225002/face/model/insightface"
 
   # LPIPS Perceptual Loss
   use_lpips_loss: true
