@@ -1,6 +1,7 @@
 import lightning as L
 from diffusers.pipelines import FluxFillPipeline, FluxPriorReduxPipeline
 import torch
+import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model_state_dict
 
 import prodigyopt
@@ -16,6 +17,183 @@ from .pipeline_tools import (
 )
 from .image_project import image_output
 from .arcface_loss import DifferentiableFaceLoss
+
+# Optional imports for perceptual losses
+try:
+    import lpips
+
+    LPIPS_AVAILABLE = True
+except ImportError:
+    LPIPS_AVAILABLE = False
+    print("[Warning] lpips not installed. Install with: pip install lpips")
+
+
+# ============================================================================
+# SSIM Loss Implementation (differentiable)
+# ============================================================================
+
+
+_ssim_kernel_cache: dict = {}
+
+
+def gaussian_kernel(
+    size: int = 11,
+    sigma: float = 1.5,
+    channels: int = 3,
+    device: torch.device = None,
+    dtype: torch.dtype = None,
+) -> torch.Tensor:
+    """Create a 2D Gaussian kernel for SSIM computation (cached)."""
+    cache_key = (size, sigma, channels, device, dtype)
+    if cache_key in _ssim_kernel_cache:
+        return _ssim_kernel_cache[cache_key]
+
+    coords = torch.arange(size, dtype=torch.float32) - (size - 1) / 2
+    g = torch.exp(-(coords**2) / (2 * sigma**2))
+    g = g / g.sum()
+    kernel = g.outer(g)
+    kernel = kernel.view(1, 1, size, size).repeat(channels, 1, 1, 1)
+
+    if device is not None or dtype is not None:
+        kernel = kernel.to(device=device, dtype=dtype)
+
+    _ssim_kernel_cache[cache_key] = kernel
+    return kernel
+
+
+def ssim_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    window_size: int = 11,
+    sigma: float = 1.5,
+    reduction: str = "mean",
+    data_range: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute differentiable SSIM loss.
+
+    SSIM measures structural similarity considering luminance, contrast, and structure.
+    Loss = 1 - SSIM (so lower is better, like other losses).
+
+    Args:
+        pred: Predicted images (B, C, H, W), values in [0, 1]
+        target: Target images (B, C, H, W), values in [0, 1]
+        window_size: Size of the Gaussian window
+        sigma: Std of the Gaussian window
+        reduction: 'mean', 'sum', or 'none'
+        data_range: Range of valid values (1.0 for [0,1] images)
+
+    Returns:
+        SSIM loss (1 - SSIM), scalar or per-sample depending on reduction
+    """
+    _, channels, H, W = pred.shape
+
+    min_dim = min(H, W)
+    if window_size > min_dim:
+        window_size = min_dim if min_dim % 2 == 1 else min_dim - 1
+        window_size = max(window_size, 3)
+
+    kernel = gaussian_kernel(
+        window_size, sigma, channels, device=pred.device, dtype=pred.dtype
+    )
+
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    pad = window_size // 2
+    mu_pred = F.conv2d(pred, kernel, padding=pad, groups=channels)
+    mu_target = F.conv2d(target, kernel, padding=pad, groups=channels)
+
+    mu_pred_sq = mu_pred**2
+    mu_target_sq = mu_target**2
+    mu_pred_target = mu_pred * mu_target
+
+    sigma_pred_sq = F.conv2d(pred**2, kernel, padding=pad, groups=channels) - mu_pred_sq
+    sigma_target_sq = (
+        F.conv2d(target**2, kernel, padding=pad, groups=channels) - mu_target_sq
+    )
+    sigma_pred_target = (
+        F.conv2d(pred * target, kernel, padding=pad, groups=channels) - mu_pred_target
+    )
+
+    sigma_pred_sq = sigma_pred_sq.clamp(min=0)
+    sigma_target_sq = sigma_target_sq.clamp(min=0)
+
+    numerator = (2 * mu_pred_target + C1) * (2 * sigma_pred_target + C2)
+    denominator = (mu_pred_sq + mu_target_sq + C1) * (
+        sigma_pred_sq + sigma_target_sq + C2
+    )
+    ssim_map = numerator / denominator
+
+    ssim_map = ssim_map.clamp(-1.0, 1.0)
+    ssim_loss_map = 1.0 - ssim_map
+
+    if reduction == "mean":
+        return ssim_loss_map.mean()
+    elif reduction == "sum":
+        return ssim_loss_map.sum()
+    else:
+        return ssim_loss_map
+
+
+def mask_weighted_mse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    mask_weight: float = 2.0,
+    background_weight: float = 1.0,
+    vae_scale_factor: int = 8,
+) -> torch.Tensor:
+    """
+    Compute MSE loss with higher weight in masked (edited) regions.
+
+    This encourages the model to pay more attention to the insertion area.
+
+    Args:
+        pred: Predicted latents/images (B, C, H, W) or (B, N, C)
+        target: Target latents/images, same shape as pred
+        mask: Binary mask (B, 1, H, W), 1 = edited region, 0 = background
+        mask_weight: Weight for masked (edited) regions
+        background_weight: Weight for background regions
+        vae_scale_factor: VAE spatial downsampling factor (8 for Flux)
+
+    Returns:
+        Weighted MSE loss (normalized by weight sum)
+    """
+    mask = mask.to(device=pred.device, dtype=pred.dtype)
+
+    mse = (pred - target) ** 2
+
+    if mask.dim() == 4 and pred.dim() == 4:
+        if mask.shape[2:] != pred.shape[2:]:
+            mask = F.interpolate(mask, size=pred.shape[2:], mode="nearest")
+    elif mask.dim() == 4 and pred.dim() == 3:
+        B, _, H_img, W_img = mask.shape
+        H_latent = H_img // vae_scale_factor
+        W_latent = W_img // vae_scale_factor
+
+        mask_latent = F.interpolate(mask, size=(H_latent, W_latent), mode="nearest")
+
+        N_packed = (H_latent // 2) * (W_latent // 2)
+        if pred.shape[1] == N_packed:
+            mask_packed = F.interpolate(
+                mask_latent, size=(H_latent // 2, W_latent // 2), mode="nearest"
+            )
+            mask = mask_packed.view(B, -1, 1)
+        else:
+            mask = mask_latent.view(B, -1, 1)
+
+    if mask.dim() == pred.dim() and mask.shape[-1] != mse.shape[-1]:
+        if pred.dim() == 3:
+            mask = mask.expand(-1, -1, mse.shape[-1])
+        else:
+            mask = mask.expand(-1, mse.shape[1], -1, -1)
+
+    weights = mask * mask_weight + (1 - mask) * background_weight
+
+    weighted_mse = (mse * weights).sum() / weights.sum()
+
+    return weighted_mse
 
 
 def debug_save_face_detection(
@@ -48,12 +226,10 @@ def debug_save_face_detection(
 
     for i in range(min(batch_size, 2)):  # 只保存前2个样本
         # 转换为 numpy (H, W, C), [0, 255]
-        ref_np = (
-            ref[i].detach().permute(1, 2, 0).cpu().numpy() * 255
-        ).astype(np.uint8)
-        pred_np = (
-            pred_target[i].detach().permute(1, 2, 0).cpu().numpy() * 255
-        ).astype(np.uint8)
+        ref_np = (ref[i].detach().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        pred_np = (pred_target[i].detach().permute(1, 2, 0).cpu().numpy() * 255).astype(
+            np.uint8
+        )
 
         # 转为 BGR (OpenCV 格式)
         ref_bgr = cv2.cvtColor(ref_np, cv2.COLOR_RGB2BGR)
@@ -125,12 +301,10 @@ class InsertAnything(L.LightningModule):
         optimizer_config: dict = None,
         gradient_checkpointing: bool = False,
     ):
-        # Initialize the LightningModule
         super().__init__()
         self.model_config = model_config
         self.optimizer_config = optimizer_config
 
-        # Load the Flux pipeline
         self.flux_fill_pipe: FluxFillPipeline = (
             FluxFillPipeline.from_pretrained(flux_fill_id).to(dtype=dtype).to(device)
         )
@@ -148,40 +322,36 @@ class InsertAnything(L.LightningModule):
         self.transformer.gradient_checkpointing = gradient_checkpointing
         self.transformer.train()
 
-        # Freeze the Flux pipeline
         self.flux_fill_pipe.text_encoder.requires_grad_(False).eval()
         self.flux_fill_pipe.text_encoder_2.requires_grad_(False).eval()
         self.flux_fill_pipe.vae.requires_grad_(False).eval()
 
-        # Initialize LoRA layers
         self.lora_layers = self.init_lora(lora_path, lora_config)
 
-        # Initialize face loss for face identity preservation
-        self.use_face_loss = model_config.get("use_face_loss", False)
+        # ==================== Loss Configuration ====================
         self.use_t_aware_weighting = model_config.get("use_t_aware_weighting", True)
+
+        # Face Identity Loss (ArcFace-based)
+        self.use_face_loss = model_config.get("use_face_loss", False)
         self.use_multiscale_face_loss = model_config.get(
             "use_multiscale_face_loss", True
         )
         if self.use_face_loss:
             self.face_loss_weight = model_config.get("face_loss_weight", 0.1)
             arcface_weights = model_config.get("arcface_weights", None)
-            arcface_model = model_config.get("arcface_model", "r50")  # r50 or r100
+            arcface_model = model_config.get("arcface_model", "r50")
             arcface_root = model_config.get("arcface_root", None)
             self.face_align_mode = model_config.get("face_align_mode", "bbox")
-
-            # Multi-scale layer weights (deeper = more identity-related)
-            # Total effective weight ~2.0 (0.1+0.2+0.3+0.4+1.0)
             self.multiscale_layer_weights = model_config.get(
                 "multiscale_layer_weights",
                 {
-                    "layer1": 0.1,  # Coarse face structure
-                    "layer2": 0.2,  # Mid-level features
-                    "layer3": 0.3,  # Fine facial details (eyes, nose, mouth)
-                    "layer4": 0.4,  # High-level semantic features
-                    "embedding": 1.0,  # Final identity embedding (most important)
+                    "layer1": 0.1,
+                    "layer2": 0.2,
+                    "layer3": 0.3,
+                    "layer4": 0.4,
+                    "embedding": 1.0,
                 },
             )
-
             self.face_loss = DifferentiableFaceLoss(
                 model_name=arcface_model,
                 pretrained_path=arcface_weights,
@@ -193,9 +363,49 @@ class InsertAnything(L.LightningModule):
                 "Multi-Scale" if self.use_multiscale_face_loss else "Single-Scale"
             )
             print(
-                f"[InsertAnything] {loss_type} Face Loss enabled with weight {self.face_loss_weight}, align {self.face_align_mode}"
+                f"[InsertAnything] {loss_type} Face Loss enabled: weight={self.face_loss_weight}, align={self.face_align_mode}"
             )
 
+        # LPIPS Perceptual Loss
+        self.use_lpips_loss = model_config.get("use_lpips_loss", False)
+        self._lpips_model = None  # Will be set after to() call
+        self._lpips_device = device
+        if self.use_lpips_loss:
+            if not LPIPS_AVAILABLE:
+                raise ImportError(
+                    "LPIPS loss requested but lpips not installed. Run: pip install lpips"
+                )
+            self.lpips_loss_weight = model_config.get("lpips_loss_weight", 0.1)
+            self._lpips_net = model_config.get("lpips_net", "vgg")
+            self._lpips_weights = model_config.get("lpips_weights", None)
+
+            if self._lpips_weights is not None and not os.path.exists(
+                self._lpips_weights
+            ):
+                raise FileNotFoundError(
+                    f"LPIPS weights not found at '{self._lpips_weights}'. "
+                    f"Download from: https://github.com/richzhang/PerceptualSimilarity/tree/master/lpips/weights/v0.1"
+                )
+
+        # SSIM Structural Similarity Loss
+        self.use_ssim_loss = model_config.get("use_ssim_loss", False)
+        if self.use_ssim_loss:
+            self.ssim_loss_weight = model_config.get("ssim_loss_weight", 0.1)
+            self.ssim_window_size = model_config.get("ssim_window_size", 11)
+            print(f"[InsertAnything] SSIM Loss enabled: weight={self.ssim_loss_weight}")
+
+        # Mask-weighted MSE Loss (prioritize edited regions)
+        self.use_mask_weighted_loss = model_config.get("use_mask_weighted_loss", False)
+        if self.use_mask_weighted_loss:
+            self.mask_region_weight = model_config.get("mask_region_weight", 2.0)
+            self.background_region_weight = model_config.get(
+                "background_region_weight", 1.0
+            )
+            print(
+                f"[InsertAnything] Mask-weighted Loss enabled: mask={self.mask_region_weight}, bg={self.background_region_weight}"
+            )
+
+        # Move model to device (handle face_loss and lpips float32 separately)
         if self.use_face_loss:
             face_loss_temp = self.face_loss
             del self.face_loss
@@ -203,6 +413,21 @@ class InsertAnything(L.LightningModule):
             self.face_loss = face_loss_temp.to(device=device, dtype=torch.float32)
         else:
             self.to(device).to(dtype)
+
+        # Initialize LPIPS AFTER self.to() to keep it in float32
+        if self.use_lpips_loss:
+            import lpips
+
+            self.lpips_model = lpips.LPIPS(
+                net=self._lpips_net,
+                model_path=self._lpips_weights,
+            ).to(device=device, dtype=torch.float32)
+            self.lpips_model.eval()
+            for param in self.lpips_model.parameters():
+                param.requires_grad = False
+            print(
+                f"[InsertAnything] LPIPS Loss enabled: weight={self.lpips_loss_weight}, net={self._lpips_net}"
+            )
 
     def init_lora(self, lora_path: str, lora_config: dict):
         assert lora_path or lora_config
@@ -251,22 +476,23 @@ class InsertAnything(L.LightningModule):
         return optimizer
 
     def training_step(self, batch, batch_idx):
-        step_loss, face_loss = self.step(batch)
+        loss_dict = self.step(batch)
+        total_loss = loss_dict["total_loss"]
+
         self.log_loss = (
-            step_loss.item()
+            total_loss.item()
             if not hasattr(self, "log_loss")
-            else self.log_loss * 0.95 + step_loss.item() * 0.05
+            else self.log_loss * 0.95 + total_loss.item() * 0.05
         )
 
-        if face_loss is not None:
-            face_loss_value = face_loss.item()
+        if loss_dict.get("face_loss") is not None:
+            face_loss_value = loss_dict["face_loss"].item()
             self.log_face_loss = (
                 face_loss_value
                 if not hasattr(self, "log_face_loss")
                 else self.log_face_loss * 0.95 + face_loss_value * 0.05
             )
-            # Use the exact t_weight from step() for consistency
-            t_weight = getattr(self, "last_t_weight", 1.0)
+            t_weight = loss_dict.get("t_weight", 1.0)
             self.log_t_weight = (
                 t_weight
                 if not hasattr(self, "log_t_weight")
@@ -276,7 +502,23 @@ class InsertAnything(L.LightningModule):
         else:
             self.log_face_loss_computed = False
 
-        return step_loss
+        if loss_dict.get("lpips_loss") is not None:
+            lpips_value = loss_dict["lpips_loss"].item()
+            self.log_lpips_loss = (
+                lpips_value
+                if not hasattr(self, "log_lpips_loss")
+                else self.log_lpips_loss * 0.95 + lpips_value * 0.05
+            )
+
+        if loss_dict.get("ssim_loss") is not None:
+            ssim_value = loss_dict["ssim_loss"].item()
+            self.log_ssim_loss = (
+                ssim_value
+                if not hasattr(self, "log_ssim_loss")
+                else self.log_ssim_loss * 0.95 + ssim_value * 0.05
+            )
+
+        return total_loss
 
     def unpack_latents(
         self,
@@ -441,24 +683,81 @@ class InsertAnything(L.LightningModule):
         pred = transformer_out[0]
 
         # Compute MSE loss (velocity prediction)
-        # target velocity = x_1 - x_0
-        mse_loss = torch.nn.functional.mse_loss(pred, (x_1 - x_0), reduction="mean")
+        target_velocity = x_1 - x_0
+
+        if self.use_mask_weighted_loss:
+            mse_loss = mask_weighted_mse_loss(
+                pred,
+                target_velocity,
+                mask,
+                mask_weight=self.mask_region_weight,
+                background_weight=self.background_region_weight,
+                vae_scale_factor=vae_scale_factor,
+            )
+        else:
+            mse_loss = F.mse_loss(pred, target_velocity, reduction="mean")
+
         self.last_t = t.mean().item()
 
-        # Compute face identity loss for person_head data type
-        face_loss = None
+        loss_dict = {
+            "mse_loss": mse_loss,
+            "face_loss": None,
+            "lpips_loss": None,
+            "ssim_loss": None,
+            "t_weight": 1.0,
+        }
         total_loss = mse_loss
 
-        # Track face loss skip reasons for monitoring
         self.face_loss_skipped_no_data_type = False
         self.face_loss_skipped_not_face = False
         self.face_loss_detection_failed = False
+
+        needs_pixel_decode = (
+            self.use_face_loss or self.use_lpips_loss or self.use_ssim_loss
+        )
+        pred_images = None
+        gt_images = None
+
+        if needs_pixel_decode:
+            t_latent = t_.to(dtype=x_t.dtype)
+            x_0_hat = (x_t - t_latent * pred).to(dtype=x_t.dtype)
+            x_0_unpacked = self.unpack_latents(x_0_hat, latent_height, latent_width)
+            pred_images = self.decode_latents(x_0_unpacked)
+
+            if self.use_lpips_loss or self.use_ssim_loss:
+                with torch.no_grad():
+                    x_0_gt_unpacked = self.unpack_latents(
+                        x_0, latent_height, latent_width
+                    )
+                    gt_images = self.decode_latents(x_0_gt_unpacked)
+
+        if self.use_t_aware_weighting:
+            t_weight = (1 - t.mean()).clamp(min=0.1, max=1.0)
+            loss_dict["t_weight"] = t_weight.item()
+        else:
+            t_weight = 1.0
+            loss_dict["t_weight"] = 1.0
+
+        if self.use_lpips_loss and pred_images is not None and gt_images is not None:
+            lpips_input_pred = pred_images.float() * 2 - 1
+            lpips_input_gt = gt_images.float() * 2 - 1
+            lpips_val = self.lpips_model(lpips_input_pred, lpips_input_gt).mean()
+            loss_dict["lpips_loss"] = lpips_val
+            total_loss = total_loss + self.lpips_loss_weight * t_weight * lpips_val
+
+        if self.use_ssim_loss and pred_images is not None and gt_images is not None:
+            ssim_val = ssim_loss(
+                pred_images.float(),
+                gt_images.float(),
+                window_size=self.ssim_window_size,
+            )
+            loss_dict["ssim_loss"] = ssim_val
+            total_loss = total_loss + self.ssim_loss_weight * t_weight * ssim_val
 
         if self.use_face_loss:
             if data_type is None:
                 self.face_loss_skipped_no_data_type = True
             else:
-                # Check if any sample in batch is face-related data
                 face_types = ("person_head", "person")
                 is_face_batch = (
                     any(dt in face_types for dt in data_type)
@@ -468,37 +767,11 @@ class InsertAnything(L.LightningModule):
 
                 if not is_face_batch:
                     self.face_loss_skipped_not_face = True
-                else:
+                elif pred_images is not None:
                     try:
-                        # ========== Differentiable Face Loss Computation ==========
-                        #
-                        # Flow Matching: x_t = (1-t) * x_0 + t * x_1
-                        # Velocity: v = x_1 - x_0
-                        # Therefore: x_0 = x_t - t * v = x_t - t * pred
-                        #
-                        # We estimate x_0 from the model's velocity prediction,
-                        # then decode to pixel space and compute face loss.
-                        # This allows gradients to flow back through the prediction.
-                        # ===========================================================
-
-                        # Estimate x_0 from velocity prediction (differentiable)
-                        # Keep latent math in VAE dtype to avoid bf16/float mismatch in decode.
-                        t_latent = t_.to(dtype=x_t.dtype)
-                        x_0_hat = (x_t - t_latent * pred).to(dtype=x_t.dtype)
-
-                        # Unpack latents from transformer format to VAE format
-                        x_0_unpacked = self.unpack_latents(
-                            x_0_hat, latent_height, latent_width
-                        )
-
-                        # Decode to pixel space (differentiable)
-                        pred_images = self.decode_latents(x_0_unpacked)
-
-                        # Extract target region (right half of diptych)
                         target_width = pred_images.shape[3] // 2
-                        pred_target = pred_images[..., target_width:]  # Right half
+                        pred_target = pred_images[..., target_width:]
 
-                        # DEBUG: 保存检测调试图像 (每100步保存一次)
                         if hasattr(self, "_debug_step_counter"):
                             self._debug_step_counter += 1
                         else:
@@ -514,13 +787,8 @@ class InsertAnything(L.LightningModule):
                                 save_dir="debug_face_detection",
                             )
 
-                        # Compute differentiable face loss
-                        # ref is the reference face image (ground truth)
-                        # pred_target is the model's prediction (gradients flow through here)
-                        # NOTE: Convert to float32 - numpy in detect_faces doesn't support bfloat16
                         if self.use_multiscale_face_loss:
-                            # Multi-scale loss: combines features from all layers
-                            face_loss, loss_dict, valid_mask = (
+                            face_loss_val, face_loss_details, valid_mask = (
                                 self.face_loss.forward_multiscale(
                                     ref.float(),
                                     pred_target.float(),
@@ -528,40 +796,27 @@ class InsertAnything(L.LightningModule):
                                     return_details=True,
                                 )
                             )
-                            # Check if any faces were detected
                             if not valid_mask.any():
                                 self.face_loss_detection_failed = True
-                                face_loss = None
+                                face_loss_val = None
                         else:
-                            # Single-scale loss: only uses final identity embedding
-                            face_loss, _, valid_mask = self.face_loss(
+                            face_loss_val, _, valid_mask = self.face_loss(
                                 ref.float(), pred_target.float(), return_details=True
                             )
-                            # Check if any faces were detected
                             if not valid_mask.any():
                                 self.face_loss_detection_failed = True
-                                face_loss = None
+                                face_loss_val = None
 
-                        # Only apply face loss if we have valid detections
-                        if face_loss is not None:
-                            # T-aware weighting: face loss is more meaningful at low t
-                            # t close to 0: x_0_hat ≈ x_0, high quality prediction
-                            # t close to 1: x_0_hat is noisy, low quality prediction
-                            # Use (1-t) with min clamp to preserve some identity signal at high t
-                            if self.use_t_aware_weighting:
-                                t_weight = (1 - t.mean()).clamp(min=0.1, max=1.0)
-                                self.last_t_weight = t_weight.item()
-                            else:
-                                t_weight = 1.0
-                                self.last_t_weight = 1.0
+                        if face_loss_val is not None:
+                            loss_dict["face_loss"] = face_loss_val
                             effective_face_weight = self.face_loss_weight * t_weight
-
-                            total_loss = mse_loss + effective_face_weight * face_loss
+                            total_loss = (
+                                total_loss + effective_face_weight * face_loss_val
+                            )
 
                     except Exception as e:
-                        # If face detection fails, just use MSE loss
                         print(f"[FaceLoss] Warning: {e}")
-                        face_loss = None
                         self.face_loss_detection_failed = True
 
-        return total_loss, face_loss
+        loss_dict["total_loss"] = total_loss
+        return loss_dict

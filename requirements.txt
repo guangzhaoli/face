@@ -13,3 +13,4 @@ datasets
 prodigyopt
 einops
 scipy
+lpips
