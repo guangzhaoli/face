@@ -68,16 +68,30 @@ def main():
 
     # 这里构造多个子数据集（按类别），并通过重载的 __add__ 在 AllDataset 中合并为一个大数据集
     # 只启用了 person、person_head、person_hair 三个数据集分支；如需添加 accessory 或 object，可取消注释上方代码
-    person_train = AllDataset(image_dir="data/train/person", data_type="person")
+
+    # 获取参考图增强配置
+    ref_augment_config = config.get("ref_augment", None)
+    if is_main_process and ref_augment_config:
+        print(f"[Train] Ref augmentation config: {ref_augment_config}")
+
+    person_train = AllDataset(
+        image_dir="data/train/person",
+        data_type="person",
+        ref_augment_config=ref_augment_config,
+    )
 
     person_head_train = AllDataset(
-        image_dir="data/train/person_head", data_type="person_head"
+        image_dir="data/train/person_head",
+        data_type="person_head",
+        ref_augment_config=ref_augment_config,
     )
     # person_hair_train = AllDataset(
-    #     image_dir="data/train/person_hair", data_type="person_hair"
+    #     image_dir="data/train/person_hair",
+    #     data_type="person_hair",
+    #     ref_augment_config=ref_augment_config,
     # )
     # train_dataset = accessory_train + person_train + object_train
-    # train_dataset = person_train + person_head_train + person_hair_traink
+    # train_dataset = person_train + person_head_train + person_hair_train
     train_dataset = person_train + person_head_train
 
     # DataLoader：封装批数据读取
