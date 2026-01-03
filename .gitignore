@@ -55,7 +55,7 @@ poetry.lock
 
 
 outputs/
-data/
+/data/
 result/
 examples/
 
